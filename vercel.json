@@ -1,17 +1,13 @@
 {
   "functions": {
-    "api/index.py": {
+    "index.py": {
       "maxDuration": 30
     }
   },
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "/api/index.py"
-    },
-    {
       "src": "/(.*)",
-      "dest": "/api/index.py"
+      "dest": "/index.py"
     }
   ]
 }
